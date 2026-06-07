@@ -1,1 +1,1 @@
-# GNN_RL_OrbitWars
+# Reinforcement Learning via Graph Neural Networks (GNNs) for Orbit Wars
