@@ -104,7 +104,15 @@ To gain familiarity with the mechanics of the game, we make `random_agent`:
         return []
 ...
 ```
-`random_agent` selects a source and target at random and sends a random fraction of ships to that planet. 
+`random_agent` selects a source and target at random and sends a random fraction of ships to that planet.
+
+The image below captures a step between two `random_agent`s:
+
+<p align="center">
+   
+<img width="508" height="508" alt="image" src="https://github.com/user-attachments/assets/719b60e2-3ecd-4c42-a7a5-11e55e9b35f3" />
+
+</p>
 
 ---
 ## A Greedy Agent - `nearest_planet_sniper`
@@ -145,6 +153,12 @@ The greedy agent uses a simple strategy:
             moves.append([mine.id, angle, ships_needed])
 ...
 ```
+
+The image below shows a simulation between a `random_agent` (in orange) and a `nearest_planet_sniper` (in blue):
+<p align="center">
+   <img width="508" height="508" alt="image" src="https://github.com/user-attachments/assets/b092137d-3a7b-4f13-8408-76376230a37b" />
+</p>
+
 The sniper agent has a few problems:
 
 * It doesn't account for travel time - the target planet produces ships while the fleet is in transit
