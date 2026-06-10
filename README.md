@@ -154,18 +154,271 @@ The sniper agent has a few problems:
 These limitations inform our construction of a physics-informed agent.
 ---
 ## Building a Physics-Informed `heuristic_agent`
+To address the problems with the sniper agent, we make a more sophisticated agent, informed by physical information about the system:
+```
+...
+    actions = []
+
+    for src in my_planets:
+        if src.id not in assignments:
+            continue  # idle planet — no assignment found
+
+        tgt, ships_to_send = assignments[src.id]
+
+        # Compute intercept point (aim at where planet WILL be, not where it is)
+        ix, iy, eta = intercept_point(
+            src.x, src.y,
+            tgt.id,
+            ships_to_send,
+            current_turn,
+            initial_planets,
+            angular_velocity
+        )
+
+        # Get a sun-safe angle toward the intercept point
+        angle = safe_angle(src.x, src.y, ix, iy)
+
+        if angle is None:
+            # No safe path exists — skip this action rather than fly into the sun
+            continue
+
+        # Guard: never send 0 ships
+        if ships_to_send <= 0:
+            continue
+
+        actions.append([src.id, angle, ships_to_send])
+...
+```
+**Evaluation against `random_agent`:**
+```
+Results over 200 games:
+  Wins:   165
+  Losses: 35
+  Draws:  0
+  Win rate: 82.5%
+```
+
+**Evaluation against `nearest_planet_sniper`:**
+```
+Results over 200 games:
+  Wins:   125
+  Losses: 75
+  Draws:  0
+  Win rate: 62.5%
+```
+
 
 ---
 ## Search and Planning with `beam_search_agent`
 
+**Initial Strategy: Monte Carlo Tree Search** (MCTS) *Lite*
+
+*Explanation*:
+
+A regular heuristic agent asks: *"what's the best action right now?"*
+MCTS asks: **"if I play this action, and then both sides play reasonably for the rest of the game, who wins?"**
+
+It does this by building a tree of possible futures, one node per game state. The four steps that repeat every iteration:
+
+1. **Selection** — starting from the root (current game state), walk down the tree picking the most promising node at each level. "Most promising" balances exploitation (nodes that have won before) vs exploration (nodes we haven't tried much). This is the UCB1 formula: $UCB1$ = $\frac{w}{n}+C\sqrt{\frac{ln N}{n}}$, where: $\frac{w}{n}$: win rate of the node (exploitation), $N$: visits to the parent, $n$: visits to this node (exploration), $C$: exploration constant (typically $\sqrt{2}$).
+
+2. **Expansion** - at a leaf node (one we haven't explored yet), add its children (one per candidate action).
+
+3. **Simulation** - from the new node, play the game to completion using our heuristic agent for both sides. Record who wins.
+
+4. **Backpropagation** - walk back up the tree, updating each node's win count and visit count.
+
+> Refer arXiv:2103.04931v4 [cs.AI] for more details
+
+> Why this doesn't work? **Long** simulation times, never converged in the length of the game.
+
+**Actual Strategy: Beam Search**
+
+*Explanation*
+
+At each decision point, instead of exploring one action (greedy) or all actions (full tree), you keep the top K candidates — called the "beam width". You expand only those K, evaluate their children, keep the top K again, and repeat for a fixed depth.
+
+At each level you prune ruthlessly — only the top K survive regardless of which parent they came from.
+
+MCTS needs many iterations to build up reliable visit counts before UCB1 means anything. With only 4-10 iterations you're essentially random.
+Beam search makes no such assumption — it does one pass, evaluates every node once, and picks the best. With a fixed K and depth D you know exactly how many deepcopy calls you'll make: K × D. 
+
+```
+...
+   # sync global env to true game state
+    sync_env_to_obs(_mcts_env, obs)
+
+    # generate and pre-rank candidates by score_target — no deepcopy yet
+    candidate_actions = _get_candidate_actions(obs)
+    if not candidate_actions:
+        return heuristic_agent(obs, config)
+
+    # pre-score each candidate cheaply using score_target
+    planets = [Planet(*p) for p in obs.planets]
+    my_planets = {p.id: p for p in planets if p.owner == my_player_id}
+    other_planets = {p.id: p for p in planets if p.owner != my_player_id}
+
+    prescored = []
+    for action in candidate_actions:
+        src_id = action[0][0]
+        src = my_planets.get(src_id)
+        if src is None:
+            continue
+        # score against best available target
+        best = max(
+            score_target(src, tgt, my_player_id, obs.step,
+                        obs.initial_planets, obs.angular_velocity)
+            for tgt in other_planets.values()
+        )
+        prescored.append((best, action))
+
+    prescored.sort(reverse=True)
+    top_candidates = [action for _, action in prescored[:K]]
+
+    # simulate only top K candidates
+    scored = []
+    for action in top_candidates:
+        sim_env = copy.deepcopy(_mcts_env)
+        opp_obs = to_obs(sim_env.state[opp_player_id].observation)
+        opp_action = heuristic_agent(opp_obs, None)
+
+        if my_player_id == 0:
+            sim_env.step([action, opp_action])
+        else:
+            sim_env.step([opp_action, action])
+
+        result_obs = to_obs(sim_env.state[my_player_id].observation)
+        score = evaluate_position(result_obs, my_player_id)
+        scored.append((score, action))
+
+    scored.sort(reverse=True)
+    best_score, best_action = scored[0]
+...
+```
+
+> Beam search can miss the best action if it gets pruned early — it's not guaranteed optimal like full tree search. But in practice for fast games with tight time budgets it tends to outperform broken MCTS significantly.
+
+> No significant difference between D = 1 or D = 2; to keep computation costs low, we set D = 1
+
+**Evaluation against `heuristic_agent`:**
+```
+Results over 200 games:
+  Wins:   188
+  Losses: 12
+  Draws:  0
+  Win rate: 94.0%
+```
+
+**Evaluation against `nearest_planet_sniper`:**
+```
+Results over 200 games:
+  Wins:   189
+  Losses: 11
+  Draws:  0
+  Win rate: 94.5%
+```
+
+
 ---
-## Proof of Concept: Imitation Learning
+## Proof of Concept: Imitation Learning via FFNs (courtesy `heuristic_agent`)
+
+<center>
+<img width="1990" height="2457" alt="image" src="https://github.com/user-attachments/assets/9534c571-826f-45c7-8feb-3e64d6377007" />
+</center>
 
 ---
 ## A First Stab at Reinforcement Learning: Vanilla PPO Implementation
 
+**Architecture of PPO Network**
+
+```
+Input: 163-dim feature vector
+         │
+         ▼
+┌─────────────────────────────┐
+│  FlattenExtractor           │  ← just passes the vector through unchanged
+└─────────────────────────────┘
+         │
+         ├──────────────────────────┐
+         ▼                          ▼
+  Policy network              Value network
+  Linear(163 → 64)            Linear(163 → 64)
+  Tanh                        Tanh
+  Linear(64 → 64)             Linear(64 → 64)
+  Tanh                        Tanh
+         │                          │
+         ▼                          ▼
+  action_net                  value_net
+  Linear(64 → 34)             Linear(64 → 1)
+         │                          │
+         ▼                          ▼
+  34 action values            1 scalar
+  (32 logits + angle          "how good is
+   + ship fraction)            this state")
+
+```
+
+
+<center>
+   <img width="1189" height="790" alt="image" src="https://github.com/user-attachments/assets/dfe301da-8e99-40ea-b3ca-7b401cb46dec" />
+</center>
+
+
+### What PPO run taught us:
+
+* `MultiDiscrete` is the right action space design: Discrete target selection dramatically outperformed the original continuous `Box` action space. PPO learns categorical decisions naturally; forcing a Gaussian policy to emulate discrete planet selection through argmax decoding produced weak learning signals and persistent exploration.
+* Random player assignment is essential: Without randomisation the policy learns correlations with fixed planet indices and spawn positions. Training from both player perspectives forces the network to learn ownership patterns and game structure rather than memorising specific IDs.
+* Sparse rewards work, dense rewards don't: Discrete target selection dramatically outperformed the original continuous Box action space. PPO learns categorical decisions naturally; forcing a Gaussian policy to emulate discrete planet selection through argmax decoding produced weak learning signals and persistent exploration.
+* Single dispatch is a hard ceiling on performance. MLP can't generalise planet positions — it memorises them. As the empire grows, the gap between available strategic options and executable actions grows larger. The policy may understand advantageous positions but lacks the ability to exploit them fully.
+
+The PPO implementation itself appears healthy.
+
+Throughout debugging:
+
+* KL divergence remained reasonable.
+* Clip fractions stayed in a healthy range.
+* Explained variance improved substantially.
+* Policies successfully learned against random opponents.
+
+The bottlenecks were not PPO hyperparameters but environment and representation design.
+
+A flat MLP can learn useful behaviours but is an inefficient representation for Orbit Wars.
+
+The game is naturally relational:
+
+* planets influence neighbouring planets
+* threats depend on travel distance
+* reinforcements depend on connectivity
+
+The MLP must infer these relationships from a flattened vector. This likely contributes to poor generalisation across map configurations and opponents.
+
+### What went wrong against `heuristic_agent`?
+
+The policy that learned to beat random never learned why it was winning — it learned surface patterns like "when I see this feature configuration, pick planet X." Against heuristic, those patterns don't transfer because heuristic responds intelligently and punishes the same moves that worked against random. The policy has no deeper strategic understanding to fall back on.
+
+This is actually the expected result given the single dispatch limitation. The heuristic sends from every planet every turn. Our agent sends from one. Even if it picks perfectly, it's operating at a fraction of the heuristic's throughput. No amount of training fixes a 5x action rate disadvantage.
+
+Further improvements are unlikely to come from PPO hyperparameter tuning alone. Future gains will likely require changes to the action space, state representation, or model architecture.
+
 ---
 ## PPO Implementation via Graph Neural Networks
+
+### A Lightning Introduction to Graph Neural Networks
+
+### Why GNNs?
+* Multi-dispatch falls out naturally from per-node scoring
+* Permutation invariance means planet IDs don't matter
+* Variable planet counts handled natively
+
+
+### What GNN fixes directly:
+
+|**Problem**|**GNN solution**|
+|-------|------------|
+|Fixed planet ID memorisation | Nodes carry own features — permutation invariant|
+Single dispatch| Per-node scoring → threshold → dispatch from all owned planets|
+Variable planet counts| Graph handles variable node counts natively|
+| No planet relationship modelling| Message passing propagates neighbour context|
 
 ---
 ## References
