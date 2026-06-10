@@ -153,6 +153,7 @@ The sniper agent has a few problems:
 * It holds ships on planets that have no nearby targets instead of consolidating
 
 These limitations inform our construction of a physics-informed agent.
+
 ---
 ## Building a Physics-Informed `heuristic_agent`
 To address the problems with the sniper agent, we make a more sophisticated agent, informed by physical information about the system:
