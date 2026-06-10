@@ -151,6 +151,7 @@ The sniper agent has a few problems:
 * It sends fleets from every planet, even if multiple are targeting the same planet
 * It ignores the sun - fleets aimed through the center get destroyed
 * It holds ships on planets that have no nearby targets instead of consolidating
+
 These limitations inform our construction of a physics-informed agent.
 ---
 ## Building a Physics-Informed `heuristic_agent`
