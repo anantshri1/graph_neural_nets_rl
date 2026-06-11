@@ -338,6 +338,83 @@ Results over 200 games:
 ---
 ## Proof of Concept: Imitation Learning via FFNs (courtesy `heuristic_agent`)
 
+At this stage, we introduce neural networks to train the next agent. Using a `multiprocessing` harness, 59114 samples of gameplay were obtained from games played by two `beam_search_agent`s:
+
+```
+...
+def collect_imitation_data(n_games=200, verbose=True, save_path=None, worker_id=0):
+    global _mcts_env
+    _mcts_env = make("orbit_wars", debug=False)
+    _mcts_env.reset()
+
+    dataset = []
+
+    for game_idx in range(n_games):
+        env = make("orbit_wars", debug=False)
+        env.reset()
+        _mcts_env = env
+
+        done = False
+        while not done:
+            obs0 = to_obs(env.state[0].observation)
+            act0 = beam_search_agent(obs0, None)
+
+            _mcts_env = env
+            obs1 = to_obs(env.state[1].observation)
+            act1 = beam_search_agent(obs1, None)
+
+            if not act0 or not act1:
+                env.step([act0, act1])
+                done = (env.state[0].status != "ACTIVE")
+                continue
+
+            feat0 = obs_to_features(obs0, my_player_id=0)
+            src0, angle0, ships0 = act0[0]
+
+            feat1 = obs_to_features(obs1, my_player_id=1)
+            src1, angle1, ships1 = act1[0]
+
+            dataset.append({"features": feat0, "source_id": int(src0),
+                            "angle": float(angle0), "ship_count_norm": float(ships0) / MAX_SHIPS})
+            dataset.append({"features": feat1, "source_id": int(src1),
+                            "angle": float(angle1), "ship_count_norm": float(ships1) / MAX_SHIPS})
+
+            env.step([act0, act1])
+            done = (env.state[0].status != "ACTIVE")
+
+        # save after every game so a disconnect only loses current game
+        if save_path is not None:
+            with open(save_path, "wb") as f:
+                pickle.dump(dataset, f)
+
+        if verbose:
+            print(f"[Worker {worker_id}] Game {game_idx + 1}/{n_games} done — {len(dataset)} samples", flush=True)
+
+    return dataset
+...
+```
+```
+...
+def run_worker(args):
+    worker_id, n_games = args
+    save_path = f"/content/drive/MyDrive/OrbitWars/imitation_data_worker{worker_id}.pkl"
+    print(f"[Worker {worker_id}] starting {n_games} games", flush=True)
+    data = collect_imitation_data(n_games=n_games, verbose=True,
+                                  save_path=save_path, worker_id=worker_id)
+    print(f"[Worker {worker_id}] done — {len(data)} samples", flush=True)
+    return data
+
+if __name__ == '__main__':
+    N_GAMES   = 200
+    N_WORKERS = 2
+    games_per_worker = N_GAMES // N_WORKERS
+
+    with multiprocessing.Pool(processes=N_WORKERS) as pool:
+        chunks = pool.map(run_worker, [(i, games_per_worker) for i in range(N_WORKERS)])
+...
+```
+The raw observations were converted to a flat numpy feature vector. The key limitation here was that the number of planets varied across games; as such, we limited this run to games with 32 planets (chosen because those had the highest frequency during data collection) and treated this as a proof of concept instead of an actual submission.
+
 <center>
 <img width="1990" height="2457" alt="image" src="https://github.com/user-attachments/assets/9534c571-826f-45c7-8feb-3e64d6377007" />
 </center>
