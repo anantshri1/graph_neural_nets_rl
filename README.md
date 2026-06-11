@@ -446,7 +446,11 @@ Imitation learning was therefore treated as a proof-of-concept and pipeline vali
 
 
 ---
-## A First Stab at Reinforcement Learning: Vanilla PPO Implementation
+## Vanilla PPO Implementation
+
+With imitation learning establishing a proof of concept for neural decision-making, the next phase introduced reinforcement learning via Proximal Policy Optimization (PPO), implemented through `Stable-Baselines3`. The goal was to move beyond mimicking the beam search agent and learn directly from game outcomes.
+
+
 
 **Architecture of PPO Network**
 
@@ -476,11 +480,26 @@ Input: 163-dim feature vector
    + ship fraction)            this state")
 
 ```
+### Action-Space Design
 
+The most consequential design decision in this phase was the action space. The naive approach — a continuous `Box` action space with Gaussian policy heads predicting a source planet logit vector, a firing angle, and a ship fraction — failed completely. The `std` of the action distribution never moved from its initialisation value of 1.0 across tens of thousands of training steps, meaning the policy never committed to any action. The root cause is a mismatch between the problem structure and the policy architecture: selecting a target planet is fundamentally a discrete choice between at most 32 options, and a Gaussian head cannot efficiently learn what is essentially a lookup. The correct angle to fire is almost always "aim at planet X" — there is no meaningful sense in which angles near the correct value are better than angles far from it in a smooth, differentiable way.
+The fix was to replace the continuous action space entirely with `MultiDiscrete([32, 32, 10])` — three independent discrete choices representing the source planet index, the target planet index, and a ship fraction bin (10% increments from 10% to 100%). Critically, the angle is never predicted by the network at all. Once the policy selects a target planet, the existing physics code (`intercept_point + safe_angle`) computes the correct interception angle deterministically. This offloads the hardest part of the geometric reasoning to the analytical toolkit built before, and lets the policy focus entirely on the strategically meaningful question of which planet to send ships to.
+
+### Observation Space
+The observation is a fixed-length `float32` vector of shape (183,), constructed by concatenating five features per planet — normalised x/y coordinates, an owner encoding relative to the current player (`0 = neutral, 1 = mine, 2 = opponent`), normalised ship count, and normalised production — across all planets, padded or truncated to a fixed count of 36, plus three global features (normalised step, my total ships, opponent total ships). The owner encoding being player-relative is essential: it ensures the same feature vector structure regardless of whether the agent is player 0 or player 1.
+
+### Reward Structure
+Two reward schemes were tested. Dense reward shaping — giving a signal proportional to the change in ship share each turn — failed despite appearing theoretically sound. Against a strong opponent, a randomly initialised policy loses ship share on almost every turn, producing a stream of small negative rewards with no variance. PPO has no contrast between good and bad actions and cannot find a gradient to follow. Sparse terminal reward (+1 for a win, -1 for a loss) was strictly better: it occasionally produces a positive signal when the agent gets lucky, and that contrast is enough to bootstrap learning.
+
+### Training Curriculum
+A two-stage curriculum was used. Round 1 trained against a random opponent for 100,000 steps, reaching approximately 60–70% win rate. Round 2 continued training against the heuristic agent for a further 100,000 steps. The transition was intentional — starting against the heuristic directly produces uniformly negative gradients early in training because the untrained policy has no chance of winning, starving it of positive signal. The random opponent provides enough winnable games to establish a baseline policy before the difficulty increases.
+One additional fix proved essential: randomly assigning the agent as player 0 or player 1 at the start of each episode. Without this, the policy learns to output fixed planet IDs associated with the starting configuration it always sees as player 0, rather than learning to read the ownership encoding from the feature vector. This is a subtle form of overfitting that produces a policy that appears to train well but generalises to zero in evaluation.
 
 <center>
    <img width="1189" height="790" alt="image" src="https://github.com/user-attachments/assets/dfe301da-8e99-40ea-b3ca-7b401cb46dec" />
 </center>
+
+The PPO agent plateaued at roughly 20% win rate against the heuristic and effectively 0% against beam search. This ceiling is architectural rather than a training failure. The heuristic dispatches fleets from every owned planet simultaneously on each turn; the PPO agent dispatches from one. As the game progresses and planet counts diverge, no policy quality can compensate for a structural 5–10x disadvantage in action throughput. This single-dispatch limitation, combined with the MLP's inability to generalise across permutations of planet assignments, motivates the GNN architecture — where multi-dispatch falls out naturally from per-node scoring, and permutation invariance is a built-in property of the graph representation rather than something the network must learn.
 
 
 ### What PPO run taught us:
