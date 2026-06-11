@@ -336,9 +336,13 @@ Results over 200 games:
 
 
 ---
-## Proof of Concept: Imitation Learning via FFNs (courtesy `heuristic_agent`)
+## Imitation Learning using Multi-Layer Perceptrons 
 
-At this stage, we introduce neural networks to train the next agent. Using a `multiprocessing` harness, 59114 samples of gameplay were obtained from games played by two `beam_search_agent`s:
+With a strong `beam_search_agent` established (~94% win rate against the `heuristic_agent` baseline), the natural next step before full RL was imitation learning — training a neural network to mimic `BeamSearch` decisions. The motivation was twofold: introduce neural policies without RL instability, and establish a performance floor that PPO would need to beat.
+
+### Data Collection
+Demonstrations were collected by running `BeamSearch` vs `BeamSearch` self-play games and recording (observation, action) pairs at every turn. Both players' decisions were logged as separate training samples, effectively doubling data collection speed. Turns where either player had no valid moves (e.g. lost all planets near end of game) were skipped since they carry no useful signal.
+Data collection was parallelised using Python's `multiprocessing.Pool` with 2 workers, each running independent game instances with their own copy of the global `_mcts_env state`. A key lesson learned here was to save incrementally after every game rather than at the end of the run — Colab session disconnects are frequent, and end-of-run saving risks losing everything.
 
 ```
 ...
@@ -413,11 +417,33 @@ if __name__ == '__main__':
         chunks = pool.map(run_worker, [(i, games_per_worker) for i in range(N_WORKERS)])
 ...
 ```
-The raw observations were converted to a flat numpy feature vector. The key limitation here was that the number of planets varied across games; as such, we limited this run to games with 32 planets (chosen because those had the highest frequency during data collection) and treated this as a proof of concept instead of an actual submission.
+A complication emerged during preprocessing: planet count is not fixed across games, varying from 20 to 44, producing feature vectors of different lengths (103 to 223 dimensions). Since a standard MLP requires fixed-size inputs, we filtered to 32-planet games (163-dimensional feature vectors), the most common configuration in the dataset. This reduced the usable dataset from ~59,000 to ~15,000 samples.
+
+### Feature Representation
+Each observation was encoded as a flat vector of planet features concatenated with global game state features. Per planet (sorted by `id` for consistent ordering): normalised x/y coordinates (divided by 100, matching the map's coordinate range), ownership encoded relative to the current player (`0 = neutral, 1 = mine, 2 = opponent`), normalised ship count (divided by `MAX_SHIPS=500`), and normalised production (divided by the maximum production value in that game). Global features appended at the end: normalised turn number, total my ships, total opponent ships. Encoding ownership relative to the current player rather than using absolute player IDs means both players' observations look identical from their own perspective, which doubles effective training data and makes the policy transferable between player slots.
+
+### Architecture
+The network uses `Keras`'s functional API with a shared trunk and three separate output heads, since the action has mixed output types. The trunk is four dense layers `(256→128→128→64)` with batch normalisation and dropout `(0.3, 0.2, 0.2)` for regularisation. The three heads are:
+* Source planet (which planet to dispatch from): 32-way softmax over planet indices, trained with categorical cross-entropy
+* Angle (direction to send the fleet): rather than regressing the angle directly — which has a wrapping discontinuity at ±π — we predict (sin θ, cos θ) separately with tanh activations, recovering the angle at inference via `atan2(sin, cos)`
+* Ship count: single sigmoid output producing a normalised fraction in [0, 1], multiplied by `MAX_SHIPS` at inference and clipped to the source planet's available ships
+
+The three loss components operate on different scales: categorical cross-entropy for 32 classes has an expected random baseline of log(32) ≈ 3.58, while MSE losses for sin/cos and ships have expected baselines of ~0.5. Without correction, cross-entropy would dominate training. Each loss was therefore weighted by the inverse of its expected random baseline, normalising all components to start at approximately 1.0:
+
+```
+total_loss = (CE / 3.58) + (sin_MSE / 0.5) + (cos_MSE / 0.5) + (ships_MSE / 0.5)
+```
+
+Training converged at epoch 46 with a source planet accuracy of ~26.9% on the validation set — 8.6x better than the random baseline of 3.1% (1/32). Train and validation losses were virtually identical (1.94 vs 1.94), indicating clean generalisation with no overfitting, which suggests the bottleneck was data quantity rather than model capacity.
 
 <center>
 <img width="1990" height="2457" alt="image" src="https://github.com/user-attachments/assets/9534c571-826f-45c7-8feb-3e64d6377007" />
 </center>
+
+In practice, the agent was not competitive against the heuristic baseline. Two fundamental limitations made this expected: the 15,000 sample dataset was too small to learn reliable angle prediction (sin/cos MSE plateaued at ~0.34), and the fixed 32-planet filter discarded ~75% of collected data. The agent also falls back to the heuristic on non-32-planet games, making evaluation results difficult to interpret cleanly.
+
+Imitation learning was therefore treated as a proof-of-concept and pipeline validation exercise rather than a serious performance milestone. The full data pipeline, multi-head architecture, and loss normalisation scheme are all sound — the limiting factor was purely data volume, which a variable-input architecture handles naturally by construction.
+
 
 ---
 ## A First Stab at Reinforcement Learning: Vanilla PPO Implementation
