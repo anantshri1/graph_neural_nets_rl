@@ -521,3 +521,7 @@ Variable planet counts| Graph handles variable node counts natively|
 - [A (Long) Peek into Reinforcement Learning](https://lilianweng.github.io/posts/2018-02-19-rl-overview/): a very nice blogpost
 - [The 37 Implementation Details of Proximal Policy Optimization](https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/): the holy grail of debugging PPO networks
 - [Theoretical Foundations of Graph Neural Networks](https://www.youtube.com/watch?v=uF53xsT7mjc) and the references therein
+- [A Gentle Introduction to Graph Neural Networks](https://distill.pub/2021/gnn-intro/)
+- Introduction to Graph Neural Networks for Machine Learning Engineers, J. H. Tanis, C. Giannella, A. V. Mariano, D. Meerzaman (2024). arXiv: [2412.19419](https://arxiv.org/abs/2412.19419)
+
+
