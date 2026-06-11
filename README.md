@@ -17,7 +17,7 @@ Each planet is represented as `[id, owner, x, y, radius, ships, production]`:
 * `production`: Integer from 1 to 5. Each turn, an owned planet generates this many ships.
 * `ships`: Current garrison. Starts between 5 and 99 (skewed toward lower values).
 
-* Orbiting planets: Planets whose `orbital_radius + planet_radius < 50` rotate around the sun at a constant angular velocity (0.025-0.05 radians/turn, randomized per game). Use initial_planets and angular_velocity from the observation to predict their positions.
+* Orbiting planets: Planets whose `orbital_radius + planet_radius < 50` rotate around the sun at a constant angular velocity (0.025-0.05 radians/turn, randomized per game). Use `initial_planets` and `angular_velocity` from the observation to predict their positions.
 * Static planets: Planets further from the center do not rotate.
 
 One symmetric group is randomly chosen as the starting planets. In a 2-player game, players start on diagonally opposite planets (Q1 and Q4). In a 4-player game, each player gets one planet from the group. Home planets start with 10 ships.
