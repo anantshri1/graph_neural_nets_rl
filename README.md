@@ -558,6 +558,171 @@ Single dispatch| Per-node scoring → threshold → dispatch from all owned plan
 Variable planet counts| Graph handles variable node counts natively|
 | No planet relationship modelling| Message passing propagates neighbour context|
 
+### What ``obs_to_graph`` needs to do, and why:
+
+The raw observation gives us a list of planet tuples. We need to turn that into a `torch_geometric.data.Data` object, which has three mandatory fields:
+* `x` — node feature matrix, shape `[num_nodes, num_features]`
+* `edge_index` — which nodes are connected, shape `[2, num_edges]` in COO format (two rows: source indices, target indices)
+* `edge_attr` — edge feature matrix, shape `[num_edges, num_edge_features]`
+
+**Node features — what to include and why each one**
+
+The key design principle: use relative positions (`Δx, Δy` from the graph centroid or from the sun), not absolute coordinates. This makes the representation approximately translation-invariant — the network sees the same pattern regardless of where on the board things happen to be.
+For each planet node we'll encode:
+
+* `dx, dy` — position relative to the sun (50, 50). We already know sun is the fixed reference point in the game, so it's the natural origin. Normalised by 50 (half the board).
+* `owner_enc` — 0 neutral, 1 mine, 2 opponent. Perspective-relative: the GNN learns "mine vs not-mine", not "player 0 vs player 1".
+* `ships_norm` — `ships` / `MAX_SHIPS`
+* `production_norm` — `production` / `max_production` across all planets
+* `is_orbiting` — boolean flag; orbiting planets move, static ones don't. The physics toolkit already computes this. Worth including so the network can learn different strategies for moving vs static targets.
+
+**Edge construction — k-nearest neighbours**
+
+We connect each planet to its k=4 nearest neighbours (by current Euclidean distance). Always connect to the sun node — but for now let's keep it simple: planet nodes only, k=4 edges. We can add the sun node later when we do the full GNN policy.
+
+**Edge features — what flows along edges**
+
+* `delta_x, delta_y` — relative position from source node to target node, normalised. Encodes direction and rough distance.
+* `dist_norm` — Euclidean distance normalised by board diagonal (~141 units). Redundant with `Δx/Δy` but useful for attention mechanisms to weight by proximity.
+* `same_owner` — 1 if both planets have the same owner, 0 otherwise. Helps the network reason about "friendly territory".
+
+```
+   planets = [Planet(*p) for p in obs.planets]
+    planets.sort(key=lambda p: p.id)   # consistent node ordering
+    N = len(planets)
+
+    max_prod = max(p.production for p in planets) or 1.0
+
+    # ── node features ────────────────────────────────────────────────────────
+    node_feats = []
+    for p in planets:
+        # position relative to sun, normalised to roughly [-1, 1]
+        dx = (p.x - SUN_X) / (MAP_SIZE / 2)
+        dy = (p.y - SUN_Y) / (MAP_SIZE / 2)
+
+        # owner from this player's perspective
+        if p.owner == -1:
+            owner_enc = 0.0        # neutral
+        elif p.owner == my_player_id:
+            owner_enc = 1.0        # mine
+        else:
+            owner_enc = 2.0        # opponent
+
+        ships_norm = p.ships / MAX_SHIPS
+        prod_norm  = p.production / max_prod
+
+        # is this planet orbiting? (same check as planet_position in physics.py)
+        orbital_radius = math.sqrt((p.x - SUN_X)**2 + (p.y - SUN_Y)**2)
+        is_orbiting    = 1.0 if (orbital_radius + p.radius) < 50 else 0.0
+
+        node_feats.append([dx, dy, owner_enc, ships_norm, prod_norm, is_orbiting])
+
+    x = torch.tensor(node_feats, dtype=torch.float)   # [N, 6]
+
+    # ── build k-NN edges ─────────────────────────────────────────────────────
+    # compute pairwise distances between all planets
+    coords = [(p.x, p.y) for p in planets]
+
+    src_list, dst_list = [], []
+    edge_feats = []
+
+    BOARD_DIAG = math.sqrt(MAP_SIZE**2 + MAP_SIZE**2)   # ≈ 141.4
+
+    for i in range(N):
+        # distance from planet i to all others
+        dists = []
+        for j in range(N):
+            if i == j:
+                continue
+            d = math.sqrt((coords[i][0]-coords[j][0])**2 + (coords[i][1]-coords[j][1])**2)
+            dists.append((d, j))
+
+        dists.sort()
+        neighbours = [j for _, j in dists[:K_NEIGHBOURS]]   # K closest
+
+        for j in neighbours:
+            # add directed edge i → j
+            src_list.append(i)
+            dst_list.append(j)
+
+            # edge features: relative position + distance + same_owner flag
+            rel_x = (coords[j][0] - coords[i][0]) / (MAP_SIZE / 2)
+            rel_y = (coords[j][1] - coords[i][1]) / (MAP_SIZE / 2)
+            dist_norm   = math.sqrt(rel_x**2 + rel_y**2)   # already normalised
+            same_owner  = 1.0 if (planets[i].owner == planets[j].owner
+                                  and planets[i].owner != -1) else 0.0
+
+            edge_feats.append([rel_x, rel_y, dist_norm, same_owner])
+
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)   # [2, E]
+    edge_attr  = torch.tensor(edge_feats, dtype=torch.float)             # [E, 4]
+
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+```
+
+Three things to note for the actual function:
+
+* `torch_geometric` uses COO (coordinate) format for edges: `edge_index` is a `[2, E]` int64 tensor where `edge_index[0]` is all the source node indices and `edge_index[1]` is all the destination node indices. So edge i goes from node `edge_index[0][i]` to node `edge_index[1][i]`.
+* We're building a directed graph — each k-NN edge goes both ways. So if planet A is a neighbour of planet B, we add both A→B and B→A. This doubles the edge count `(2 × N × K edges total)` but gives the message passing something to work with in both directions.
+* `is_orbiting` is just (`orbital_radius + planet_radius) < 50` — the exact same check from `planet_position` in the physics toolkit.
+
+### Why ``GATv2Conv``:
+
+The GNN encoder takes a graph, outputs a per-node embedding vector. This is the "understanding" part of the network. We'll use ``GATv2Conv`` (Graph Attention Network v2) from ``PyTorch Geometric``.
+
+The original GAT computes attention weights as:
+
+<center>
+  $\alpha_{ij}$ = softmax( $a^T$ · LeakyReLU( $W·h_i$ || $W·h_j$ ) )
+</center>
+
+The problem is that `W·h_i` and `W·h_j` are computed before they interact — so the attention is actually a function of `W·h_i` alone when you factor it. GATv2 fixes this by concatenating before the linear transform:
+
+<center>
+  $\alpha_{ij}$ = softmax( $a^T$ · LeakyReLU($W$ · $[h_i$ || $h_j$] ) )
+</center>
+
+Now the attention weight genuinely depends on the pair `(i, j)`, not just `i`. For OrbitWars this matters: whether planet A should "pay attention" to planet B depends on both of them — their relative ownership, ship counts, and proximity all interact.
+
+After the encoder runs, we have `h`: a matrix of shape `[N, 64]` — one 64-dimensional embedding per planet. The network now needs to answer two questions:
+
+* **Policy head (actor)** : *"which action should I take?"* In our `MultiDiscrete([32, 32, 10])` space this means producing three independent probability distributions — one over source planets, one over target planets, one over ship fraction bins.
+* **Value head (critic)**: *"how good is the current state overall?"* This needs to be a single scalar — not per-planet, but a global assessment. We get there by global mean pooling: average all node embeddings into one vector, then pass through an MLP. This is the standard approach and it's permutation-invariant by construction — the mean of a set doesn't depend on ordering.
+
+The policy head is more interesting. We have N planet embeddings but a fixed 40-slot action space. The way to handle this cleanly:
+
+* For source and target: learn a linear projection `[64 → 1]` that scores each node. This gives `[N, 1]` scores. Pad to [40, 1] (zeros for missing slots) and apply softmax. The network learns "what makes a planet a good source / good target" as a scoring function over embeddings.
+* For ship fraction: global mean pool → small MLP → 10 logits. Ship fraction is a global decision (how aggressive to be right now), not a per-planet one.
+
+### Masking
+
+**Rationale**
+
+With 40 source slots but only 6 valid ones, roughly 85% of source samples are invalid at any given turn. PPO wastes most of its exploration budget on actions it will never execute. Worse, the entropy bonus encourages exploring all 40 slots equally — so the policy is actively rewarded for spreading probability mass over illegal actions.
+Action masking fixes this by zeroing out illegal logits before the softmax, so illegal actions get exactly zero probability. SB3 supports this natively through `MaskablePPO` from the `sb3-contrib package`.
+The mask itself is simple — a boolean vector of length 40 for source (`True` where the planet is owned by us), another for target (`True` where the planet exists and isn't our source), and `all-True` for ship bins. We compute this from `obs` at each step.
+
+`MaskablePPO` expects the environment to implement a method called `action_masks()` that returns a flat boolean numpy array. For a `MultiDiscrete([40, 40, 10])` space, this array has length `40 + 40 + 10 = 90`. The first 40 entries mask the source distribution, the next 40 mask the target distribution, the last 10 mask the ship bins. `True` means *"this action is legal"*, `False` means *"zero probability, never sample this"*.
+
+The masking happens inside the distribution layer before sampling — so illegal actions are never chosen, and the entropy calculation only counts legal actions. This is exactly what we want.
+
+**What the masks should be**:
+
+* Source mask: True only for planets we own that have at least 1 ship.
+* Target mask: True for any planet that exists in this game and isn't the source. We can't know the source at mask-construction time (it hasn't been sampled yet), so we mask out planets that don't exist in the game. The `source == target` case is handled in `_decode_action` by returning `[]` — it's rare enough that letting it fall through to do-nothing is fine.
+* Ship bins: all True — all fractions are always legal.
+
+To establish a baseline and check network connections, we implement a baseline PPO with masking, the results of which are shown below:
+
+<img width="1189" height="790" alt="image" src="https://github.com/user-attachments/assets/a13cbd1f-4e86-4a9e-a041-f05dc583f142" />
+
+**What's the damage?**
+
+The critic learning well (explained variance 0.93) while the actor stays flat is a known failure mode in PPO with sparse rewards and hard-to-represent observations. The critic only needs to predict "is this state winning or losing" — a signal it can extract even from a mediocre representation. The actor needs to identify which specific action caused the win, which requires meaningful features. The flat padded MLP can't provide those.
+
+The baseline failure mode is now well-characterized: **the actor's action distributions remain almost uniform despite healthy training metrics.**
+
+
 ---
 ## References
 - [Deep Learning Drizzle](https://github.com/kmario23/deep-learning-drizzle#tada-graph-neural-networks-geometric-dl-confetti_ball-balloon): a very nice collection of references
