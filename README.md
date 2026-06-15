@@ -919,7 +919,7 @@ We propose:
 A few things to think through before implementing:
 The intermediate rewards need to be causally clean. Planet captures are good — they're directly caused by a fleet arriving, which was dispatched by a specific action. Planet losses are trickier — you lose a planet when an enemy fleet arrives, which you had no direct control over at that moment. Penalising losses might discourage the agent from sending ships (to keep planets defended) rather than teaching it to defend strategically.
 
-## **Run 3: Debugging `gnn_policy_v2.py`**
+### **Run 3: Debugging `gnn_policy_v2.py`**
 
 The bug is in `_build_edges`. Every call to `torch.tensor()` from a Python list creates a leaf tensor with no gradient history — it's treated as a constant input, not part of the computation graph. So when PyTorch tries to backpropagate through the GNN layers, it hits the edge tensors and stops. The encoder weights receive no gradient, the scorers receive no gradient, and the policy loss is effectively zero.
 The value head *still* learns because its gradient path goes: `value_head → global_h → h → conv layers → x`. The `x` tensor does come from `obs` via `planet_data[active_ids]` — that slice preserves the computation graph. But `edge_index` and `edge_attr` are built fresh from Python lists, severing the path for everything that flows through the attention weights.
