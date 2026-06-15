@@ -544,10 +544,11 @@ Further improvements are unlikely to come from PPO hyperparameter tuning alone. 
 ### A Lightning Introduction to Graph Neural Networks
 
 ### Why GNNs?
-* Multi-dispatch falls out naturally from per-node scoring
-* Permutation invariance means planet IDs don't matter
-* Variable planet counts handled natively
-
+The MLP policy hit a hard architectural ceiling (~50-60% win rate vs random, ~20% vs heuristic). The root causes were all representational:
+* Fixed planet ID memorisation: the MLP saw a flat padded vector where planet ID 0's features were always in positions 0-4. It learned correlations with specific positions rather than ownership patterns.
+* Single dispatch: the MLP produced one action per turn. The heuristic sends from every planet simultaneously. No amount of training closes a 5x action rate gap.
+* No relationship modelling: the MLP had to infer spatial relationships (proximity, threat, connectivity) from a flattened vector. The GNN propagates this context via message passing.
+* Variable planet counts: the MLP required padding/truncation to a fixed size. The GNN handles variable node counts natively.
 
 ### What GNN fixes directly:
 
@@ -557,6 +558,24 @@ Further improvements are unlikely to come from PPO hyperparameter tuning alone. 
 Single dispatch| Per-node scoring → threshold → dispatch from all owned planets|
 Variable planet counts| Graph handles variable node counts natively|
 | No planet relationship modelling| Message passing propagates neighbour context|
+
+### Environmental Constraints
+Planet count varies per game: 20-40 planets in 5-10 symmetric groups of 4. At least 3 groups are static, at least one is orbiting. Planet IDs are 0-indexed, max ID observed across 500 games is 39. Action space ceiling: `N_PLANETS = 40`, `N_SHIP_BINS = 10`, giving `MultiDiscrete([40, 40, 10])`.
+
+### File Structure
+
+```
+/content/drive/MyDrive/OrbitWars/
+├── physics.py                  — physics toolkit (phases 1-3, unchanged)
+├── orbitwars_agents.py         — original agents (heuristic, beam search, etc.)
+├── gnn_orbitwars_agents.py     — GNN-specific agents with updated obs_to_features
+├── gnn_orbitwars_env.py        — first GNN env attempt (MLP baseline with masking)
+├── gnn_orbitwars_env_v2.py     — current env with intermediate rewards
+├── gnn_policy.py               — first GNN policy attempt (global pool — broken)
+├── gnn_policy_v2.py            — second attempt (broken edge_attr gradient)
+├── gnn_policy_v3.py            — current working policy
+└── gnn_ppo_checkpoints/        — saved checkpoints
+```
 
 ### What ``obs_to_graph`` needs to do, and why:
 
@@ -578,7 +597,7 @@ For each planet node we'll encode:
 
 **Edge construction — k-nearest neighbours**
 
-We connect each planet to its k=4 nearest neighbours (by current Euclidean distance). Always connect to the sun node — but for now let's keep it simple: planet nodes only, k=4 edges. We can add the sun node later when we do the full GNN policy.
+Each planet connects to its k=4 nearest neighbours by current Euclidean distance, bidirectionally. So if planet A is a neighbour of planet B, we add both A→B and B→A. Total edges: `2 × N × K`. 
 
 **Edge features — what flows along edges**
 
@@ -666,33 +685,74 @@ Three things to note for the actual function:
 * We're building a directed graph — each k-NN edge goes both ways. So if planet A is a neighbour of planet B, we add both A→B and B→A. This doubles the edge count `(2 × N × K edges total)` but gives the message passing something to work with in both directions.
 * `is_orbiting` is just (`orbital_radius + planet_radius) < 50` — the exact same check from `planet_position` in the physics toolkit.
 
+The environment passes a flat 243-dim float32 vector to SB3. Layout:
+```
+[planet_slot_0 (6 features)] [planet_slot_1 (6 features)] ... [planet_slot_39 (6 features)] [step_norm, my_ships_norm, opp_ships_norm]
+```
+
+Slots for planets that don't exist in the current game are all zeros including `is_active=0.0`. This lets the GNN reliably detect active planets inside the policy via `planet_data[:, 5] > 0.5`.
+
+Why `is_active matters`: a planet with zero ships and zero production would look identical to a padding slot without this flag. With it, graph reconstruction inside the network is unambiguous.
+
+This lives in `gnn_orbitwars_agents.py` — a separate file from `orbitwars_agents.py` so the original observation format (used by heuristic and beam search agents) is preserved.
+
 ### Why ``GATv2Conv``:
 
 The GNN encoder takes a graph, outputs a per-node embedding vector. This is the "understanding" part of the network. We'll use ``GATv2Conv`` (Graph Attention Network v2) from ``PyTorch Geometric``.
 
 The original GAT computes attention weights as:
 
-<center>
-  $\alpha_{ij}$ = softmax( $a^T$ · LeakyReLU( $W·h_i$ || $W·h_j$ ) )
-</center>
+```
+  α_ij = softmax( a^T · LeakyReLU( W·h_i || W·h_j ) )
+```
 
 The problem is that `W·h_i` and `W·h_j` are computed before they interact — so the attention is actually a function of `W·h_i` alone when you factor it. GATv2 fixes this by concatenating before the linear transform:
-
-<center>
-  $\alpha_{ij}$ = softmax( $a^T$ · LeakyReLU($W$ · $[h_i$ || $h_j$] ) )
-</center>
-
+```
+α_ij = softmax( a^T · LeakyReLU( W · [h_i || h_j] ) )
+```
 Now the attention weight genuinely depends on the pair `(i, j)`, not just `i`. For OrbitWars this matters: whether planet A should "pay attention" to planet B depends on both of them — their relative ownership, ship counts, and proximity all interact.
 
-After the encoder runs, we have `h`: a matrix of shape `[N, 64]` — one 64-dimensional embedding per planet. The network now needs to answer two questions:
+After the encoder runs, we have `h`: a matrix of shape `[N, 64]` — one 64-dimensional embedding per planet. 
 
-* **Policy head (actor)** : *"which action should I take?"* In our `MultiDiscrete([32, 32, 10])` space this means producing three independent probability distributions — one over source planets, one over target planets, one over ship fraction bins.
-* **Value head (critic)**: *"how good is the current state overall?"* This needs to be a single scalar — not per-planet, but a global assessment. We get there by global mean pooling: average all node embeddings into one vector, then pass through an MLP. This is the standard approach and it's permutation-invariant by construction — the mean of a set doesn't depend on ordering.
+**Architecture**
+```
+Layer 1: GATv2Conv(6 → 16, heads=4, concat=True)  → [N, 64]  + ELU
+Layer 2: GATv2Conv(64 → 16, heads=4, concat=True) → [N, 64]  + ELU + residual
+Layer 3: GATv2Conv(64 → 16, heads=4, concat=True) → [N, 64]  + ELU + residual
+```
+
+The network now needs to answer two questions:
+
+* **Policy head (actor)** : *"which action should I take?"*
+
+In our `MultiDiscrete([40, 40, 10])` space this means producing three independent probability distributions — one over source planets, one over target planets, one over ship fraction bins.
+* **Value head (critic)**: *"how good is the current state overall?"*
+
+This needs to be a single scalar — not per-planet, but a global assessment. We get there by global mean pooling: average all node embeddings into one vector, then pass through an MLP. This is the standard approach and it's permutation-invariant by construction — the mean of a set doesn't depend on ordering.
 
 The policy head is more interesting. We have N planet embeddings but a fixed 40-slot action space. The way to handle this cleanly:
 
 * For source and target: learn a linear projection `[64 → 1]` that scores each node. This gives `[N, 1]` scores. Pad to [40, 1] (zeros for missing slots) and apply softmax. The network learns "what makes a planet a good source / good target" as a scoring function over embeddings.
 * For ship fraction: global mean pool → small MLP → 10 logits. Ship fraction is a global decision (how aggressive to be right now), not a per-planet one.
+
+```
+h [N, 64]
+ ↓                           ↓
+per-node scorer            global mean pool → [64]
+Linear(64→1) × 2            ↓                    ↓
+ ↓                      ship_head           value_head
+src_scores [N]          MLP → [10]          MLP → scalar
+tgt_scores [N]
+ ↓
+scatter into [40] slots
+(-1e9 for inactive slots)
+ ↓
+[40] src_logits + [40] tgt_logits + [10] ship_logits = [90] total
+```
+
+Source and target logits come from per-node scoring — the network learns "what makes a good source" and "what makes a good target" as properties of individual node embeddings. Ship fraction and value come from global mean pooling — these are global decisions about the current game state, not per-planet decisions.
+Empty planet slots get logit `-1e9` so `exp(-1e9) ≈ 0` — they never get selected.
+
 
 ### Masking
 
@@ -716,11 +776,159 @@ To establish a baseline and check network connections, we implement a baseline P
 
 <img width="1189" height="790" alt="image" src="https://github.com/user-attachments/assets/a13cbd1f-4e86-4a9e-a041-f05dc583f142" />
 
+> Heuristic fallback removed: when `_decode_action` returns `[]` (invalid action), we execute `[]` (do nothing) rather than falling back to heuristic. The heuristic fallback poisoned the reward signal — PPO attributed the heuristic's reward to whatever action it had chosen.
+
 **What's the damage?**
 
 The critic learning well (explained variance 0.93) while the actor stays flat is a known failure mode in PPO with sparse rewards and hard-to-represent observations. The critic only needs to predict "is this state winning or losing" — a signal it can extract even from a mediocre representation. The actor needs to identify which specific action caused the win, which requires meaningful features. The flat padded MLP can't provide those.
 
 The baseline failure mode is now well-characterized: **the actor's action distributions remain almost uniform despite healthy training metrics.**
+
+**What SB3 expects from a custom policy**
+
+SB3's `MaskablePPO` with a custom policy requires subclassing `MaskableActorCriticPolicy`. The key method to override is `extract_features` — everything else (sampling, entropy, value computation) SB3 handles. But actually for our case the cleanest override is different: we subclass and replace the `mlp_extractor` with our GNN, keeping everything else standard.
+Concretely, SB3's forward pass does this:
+```
+obs → extract_features → mlp_extractor → [latent_pi, latent_vf] → action_net / value_net
+```
+We replace `mlp_extractor` with a module that:
+* Receives the flat observation vector
+* Reconstructs the graph internally
+Runs the GNN encoder
+* Returns `[latent_pi, latent_vf]` — two 64-dim vectors SB3 can pass to the action and value heads
+The action and value heads stay standard SB3 linear layers. We don't replace those.
+
+**The one complication**: graph reconstruction needs `planet_ids`
+Inside `mlp_extractor.forward()` we only receive the flat observation tensor. We need to reconstruct which planet IDs are active in this game. The observation vector encodes this implicitly — a planet slot with all-zero features is a padded empty slot. So we detect active planets by checking which slots have non-zero features.
+
+This is slightly fragile — a planet with genuinely zero ships and zero production could look like padding. We'll add a dedicated "is active" flag to the observation to make this robust. That means a small change to `obs_to_features`.
+
+```
+def obs_to_features(obs, my_player_id):
+    """
+    Convert observation to a flat float32 vector of shape (243,).
+
+    Layout: 40 planet slots × 6 features, then 3 global features.
+
+    Per-planet features (index within slot):
+        0: x_norm        — (x - 50) / 50, relative to sun
+        1: y_norm        — (y - 50) / 50, relative to sun
+        2: owner_enc     — 0 neutral, 1 mine, 2 opponent
+        3: ships_norm    — ships / MAX_SHIPS
+        4: prod_norm     — production / max_production
+        5: is_active     — 1.0 if planet exists in this game, 0.0 if padding
+
+    Global features (last 3):
+        step_norm, my_ships_norm, opp_ships_norm
+    """
+    planets = [Planet(*p) for p in obs.planets]
+
+    # build a lookup by planet ID for fast access
+    planet_by_id = {p.id: p for p in planets}
+
+    max_prod = max(p.production for p in planets) or 1.0
+
+    my_total_ships  = 0.0
+    opp_total_ships = 0.0
+
+    # iterate over ALL 40 slots in order
+    planet_features = []
+    for slot in range(N_PLANET_SLOTS):
+        if slot in planet_by_id:
+            p = planet_by_id[slot]
+
+            x_norm = (p.x - 50.0) / 50.0
+            y_norm = (p.y - 50.0) / 50.0
+
+            if p.owner == -1:
+                owner_enc = 0.0
+            elif p.owner == my_player_id:
+                owner_enc = 1.0
+            else:
+                owner_enc = 2.0
+
+            ships_norm = p.ships / MAX_SHIPS
+            prod_norm  = p.production / max_prod
+            is_active  = 1.0
+
+            if p.owner == my_player_id:
+                my_total_ships += p.ships
+            elif p.owner != -1:
+                opp_total_ships += p.ships
+
+            planet_features.extend([
+                x_norm, y_norm, owner_enc,
+                ships_norm, prod_norm, is_active
+            ])
+        else:
+            # padding slot — planet doesn't exist in this game
+            planet_features.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    global_features = [
+        obs.step / MAX_STEP,
+        my_total_ships  / MAX_SHIPS,
+        opp_total_ships / MAX_SHIPS,
+    ]
+
+    return np.array(planet_features + global_features, dtype=np.float32)
+```
+
+The `GNNExtractor` is the core piece. It's a PyTorch module that SB3 will use as its `mlp_extractor` — receiving the flat 243-dim observation and returning two 64-dim vectors: `latent_pi` for the policy head and `latent_vf` for the value head. The key thing it does internally that no standard SB3 extractor does: reconstructs the graph from the flat vector before running the GNN. The env stays standard, graph construction lives inside the network.
+
+**What's the damage**
+
+Right now all 90 logits come from one pooled graph vector.
+What we want is:
+* source logits from node scores
+* target logits from node scores
+* ship logits from pooled graph state which preserves the graph structure all the way to the action selection stage.
+
+SB3 handles PPO, masking, entropy, clipping, optimization while we handle graph encoding, source, target, ship scoring and value prediction.
+
+### **Run 2: Debugging `gnn_policy.py`**
+
+SB3 calls three different methods depending on context:
+* `forward()` — during rollout collection, needs actions + values + log probs
+* `_predict()` — during `model.predict()`, needs actions only
+* `evaluate_actions()` — during training update, needs log probs + entropy + values for a batch of `(obs, action)` pairs
+
+All three need to produce logits from the same per-node scoring. The cleanest approach is to write one internal method `_get_logits_and_value(obs)` that does all the graph work and returns `(source_logits, target_logits, ship_logits, value)` — then `forward`,` _predict,` and `evaluate_actions` all call that one method. No duplicated graph reconstruction code.
+
+**What's the damage?**
+
+`policy_gradient_loss` of 1.2e-10 is essentially zero. The policy is not updating at all despite the value loss being nonzero (meaning the critic is trying to learn). This points to one thing: the gradients from the policy head are not flowing back through evaluate_actions.
+The likely cause is a subtle PyTorch issue with how we build tensors inside `_forward_single`. Lines like:
+```
+pythonedge_index = torch.tensor([src_list, dst_list], dtype=torch.long, device=device)
+edge_attr  = torch.tensor(attr_list, dtype=torch.float, device=device)
+torch.tensor()
+```
+creates a new tensor from data and breaks the computation graph — gradients cannot flow through it. The GNN forward pass runs correctly, but the path from logits back to encoder weights is severed during edge construction. The fix is to use `torch.stack` or keep tensors alive from the original `obs` input rather than rebuilding from Python lists.
+This is why stochastic performance is 84% — the policy from the previous run was loaded and is working at inference time — but training produces zero gradient updates.
+
+The raw source logits all being nearly identical (-0.13 to -0.25 range, very close together) confirms the per-node scorer is outputting nearly uniform scores. This is consistent with zero gradients — the scorer weights haven't moved from initialisation.
+The target logits show a clearer pattern (some around -0.07, others around -0.30) which is more promising, but still nearly uniform after softmax.
+
+
+The sparse +1/-1 signal over 400 steps means the credit assignment problem is severe — an action on turn 50 that leads to winning on turn 380 gets essentially no gradient signal.
+We propose:
+* Planet captured: +0.3
+* Planet lost: -0.1
+* Terminal win: +5, loss: -5, draw: 0
+
+A few things to think through before implementing:
+The intermediate rewards need to be causally clean. Planet captures are good — they're directly caused by a fleet arriving, which was dispatched by a specific action. Planet losses are trickier — you lose a planet when an enemy fleet arrives, which you had no direct control over at that moment. Penalising losses might discourage the agent from sending ships (to keep planets defended) rather than teaching it to defend strategically.
+
+## **Run 3: Debugging `gnn_policy_v2.py`**
+
+The bug is in `_build_edges`. Every call to `torch.tensor()` from a Python list creates a leaf tensor with no gradient history — it's treated as a constant input, not part of the computation graph. So when PyTorch tries to backpropagate through the GNN layers, it hits the edge tensors and stops. The encoder weights receive no gradient, the scorers receive no gradient, and the policy loss is effectively zero.
+The value head *still* learns because its gradient path goes: `value_head → global_h → h → conv layers → x`. The `x` tensor does come from `obs` via `planet_data[active_ids]` — that slice preserves the computation graph. But `edge_index` and `edge_attr` are built fresh from Python lists, severing the path for everything that flows through the attention weights.
+
+**Proposed Fix:**
+
+`edge_index` doesn't need gradients — it's just integer indices telling PyTorch which nodes to aggregate. That's fine as `torch.tensor()`.
+`edge_attr` does need to stay in the graph, because the GATv2 attention mechanism uses edge features to compute attention weights, and those weights influence the node embeddings h. The fix is to build `edge_attr` from slices of `x` (which is already in the graph) rather than from Python floats.
+
 
 
 ---
