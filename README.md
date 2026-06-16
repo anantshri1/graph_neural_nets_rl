@@ -1075,11 +1075,11 @@ Fix: rebuild optimiser after `_build_gnn()` in `__init__`.
 
 Verification before training:
 
-Optimiser params: 45,545 ✅
-Policy params: 45,545 ✅
-Encoder weights changed after one update: True, delta 0.007258 ✅
-Scorer weights changed after one update: True, delta 0.002714 ✅
-log_prob_new - log_prob_old nonzero ✅
+- Optimiser params: 45,545 ✅
+- Policy params: 45,545 ✅
+- Encoder weights changed after one update: True, delta 0.007258 ✅
+- Scorer weights changed after one update: True, delta 0.002714 ✅
+- `log_prob_new` - `log_prob_old nonzero` ✅
 
 Config: sparse +1/-1 reward first, then switched to intermediate rewards (+0.5 per capture, -0.3 per loss, terminal +5/-5), `n_steps=2048`, `n_envs=4`, `lr=1e-4`, `n_epochs=5`, `ent_coef=0.02`, `max_grad_norm=0.5`, `opponent=random`.
 
@@ -1119,7 +1119,7 @@ Next steps in order:
 |`lr` |1e-4 | 3e-4 caused clip fraction drift above 0.2|
 | `n_steps` |2048| Smaller values (256) give noisy advantage estimates |
 |`n_envs` | 4 | 4x data throughput, independent masking per env| 
-| `n_epochs` 5| 10 caused overfitting within each rollout batch| 
+| `n_epochs` | 5| 10 caused overfitting within each rollout batch| 
 | `ent_coef` | 0.02| Maintains exploration, prevents premature convergence|
 |`max_grad_norm` |0.5 | Protects against spikes while value head calibrates|
 |`gamma` | 0.99| Standard, games are up to 400 steps| 
