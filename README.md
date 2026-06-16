@@ -956,7 +956,8 @@ def action_masks(self):
 ```
 
 **Bug 2: broken computation graph in _build_edges**
-First implementation built edge_attr from Python scalars:
+
+First implementation `built edge_attr` from Python scalars:
 ```
 # BROKEN — severs gradient path
 rel_x = diff[j, 0].item()   # .item() converts to Python float, no gradient
@@ -978,6 +979,7 @@ edge_attr = torch.stack(edge_attr_list, dim=0)   # preserves computation graph
 `edge_index` doesn't need gradients (integer indices) so `torch.tensor()` is fine there. `edge_attr` does need to stay in the graph because GATv2 attention weights depend on edge features.
 
 **Bug 3: global pooling bottleneck `(gnn_policy.py v1)`**
+
 First policy implementation mean-pooled all node embeddings before computing action logits:
 ```
 # WRONG — loses per-node information
@@ -987,9 +989,11 @@ pi = self.pi_head(global_h)   # [64]
 # network has no idea which logits correspond to which planets
 ```
 Diagnostic confirmation: source logit range was -0.13 to -0.25 (nearly uniform), target logits nearly uniform at ~0.031 probability each. The network had learned coarse win/loss prediction (explained variance 0.93) but couldn't identify which specific planet to target.
+
 Fix: per-node scoring before scattering into fixed slots.
 
 **Bug 4: optimiser missing GNN parameters (critical)**
+
 This was the most damaging bug. SB3 creates the optimiser during `super().__init__()`, before `_build_gnn()` adds our custom parameters:
 ```
 def __init__(self, ...):
@@ -997,7 +1001,8 @@ def __init__(self, ...):
     self._build_gnn()       # encoder/scorers added AFTER — optimiser never sees them
 ```
 Diagnostic: optimiser had 22,204 parameters, policy had 45,545. GNN weights computed gradients correctly but the optimiser had no parameter groups to update. Weights never moved. `policy_gradient_loss` was ~1e-10 across every training run. `approx_kl` and `clip_fraction` were exactly 0.
-Fix: rebuild the optimiser after _build_gnn():
+
+Fix: rebuild the optimiser after `_build_gnn()`:
 ```
 def __init__(self, ...):
     kwargs['net_arch'] = []
