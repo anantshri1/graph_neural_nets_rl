@@ -502,7 +502,7 @@ One additional fix proved essential: randomly assigning the agent as player 0 or
 The PPO agent plateaued at roughly 20% win rate against the heuristic and effectively 0% against beam search. This ceiling is architectural rather than a training failure. The heuristic dispatches fleets from every owned planet simultaneously on each turn; the PPO agent dispatches from one. As the game progresses and planet counts diverge, no policy quality can compensate for a structural 5–10x disadvantage in action throughput. This single-dispatch limitation, combined with the MLP's inability to generalise across permutations of planet assignments, motivates the GNN architecture — where multi-dispatch falls out naturally from per-node scoring, and permutation invariance is a built-in property of the graph representation rather than something the network must learn.
 
 
-### What PPO run taught us:
+### What the PPO run taught us:
 
 * `MultiDiscrete` is the right action space design: Discrete target selection dramatically outperformed the original continuous `Box` action space. PPO learns categorical decisions naturally; forcing a Gaussian policy to emulate discrete planet selection through argmax decoding produced weak learning signals and persistent exploration.
 * Random player assignment is essential: Without randomisation the policy learns correlations with fixed planet indices and spawn positions. Training from both player perspectives forces the network to learn ownership patterns and game structure rather than memorising specific IDs.
@@ -550,7 +550,7 @@ The MLP policy hit a hard architectural ceiling (~50-60% win rate vs random, ~20
 * No relationship modelling: the MLP had to infer spatial relationships (proximity, threat, connectivity) from a flattened vector. The GNN propagates this context via message passing.
 * Variable planet counts: the MLP required padding/truncation to a fixed size. The GNN handles variable node counts natively.
 
-### What GNN fixes directly:
+**What GNN fixes directly:**
 
 |**Problem**|**GNN solution**|
 |-------|------------|
@@ -577,7 +577,7 @@ Planet count varies per game: 20-40 planets in 5-10 symmetric groups of 4. At le
 └── gnn_ppo_checkpoints/        — saved checkpoints
 ```
 
-### What ``obs_to_graph`` needs to do, and why:
+### Graph Construction - what ``obs_to_graph`` needs to do, and why:
 
 The raw observation gives us a list of planet tuples. We need to turn that into a `torch_geometric.data.Data` object, which has three mandatory fields:
 * `x` — node feature matrix, shape `[num_nodes, num_features]`
@@ -696,7 +696,7 @@ Why `is_active matters`: a planet with zero ships and zero production would look
 
 This lives in `gnn_orbitwars_agents.py` — a separate file from `orbitwars_agents.py` so the original observation format (used by heuristic and beam search agents) is preserved.
 
-### Why ``GATv2Conv``:
+### GNN Encoder - Why ``GATv2Conv``:
 
 The GNN encoder takes a graph, outputs a per-node embedding vector. This is the "understanding" part of the network. We'll use ``GATv2Conv`` (Graph Attention Network v2) from ``PyTorch Geometric``.
 
@@ -720,6 +720,12 @@ Layer 1: GATv2Conv(6 → 16, heads=4, concat=True)  → [N, 64]  + ELU
 Layer 2: GATv2Conv(64 → 16, heads=4, concat=True) → [N, 64]  + ELU + residual
 Layer 3: GATv2Conv(64 → 16, heads=4, concat=True) → [N, 64]  + ELU + residual
 ```
+
+`hidden_dim=64`, `n_heads=4` requires `hidden_dim % n_heads == 0` giving 16 units per head. Residual connections on layers 2 and 3 (not layer 1, since dimensions change from 6→64). Edge features (edge_dim=4) are included in the attention score computation.
+
+`edge_attr` is passed to all three conv layers. This means proximity and ownership information on edges directly influences which neighbours get attended to.
+
+> Shared encoder: one GNN encoder produces embeddings used by both source scorer, target scorer, ship head, and value head. Separate encoders for source vs target scoring is flagged as future work.
 
 The network now needs to answer two questions:
 
@@ -754,7 +760,7 @@ Source and target logits come from per-node scoring — the network learns "what
 Empty planet slots get logit `-1e9` so `exp(-1e9) ≈ 0` — they never get selected.
 
 
-### Masking
+### Action Masking
 
 **Rationale**
 
@@ -777,6 +783,7 @@ To establish a baseline and check network connections, we implement a baseline P
 <img width="1189" height="790" alt="image" src="https://github.com/user-attachments/assets/a13cbd1f-4e86-4a9e-a041-f05dc583f142" />
 
 > Heuristic fallback removed: when `_decode_action` returns `[]` (invalid action), we execute `[]` (do nothing) rather than falling back to heuristic. The heuristic fallback poisoned the reward signal — PPO attributed the heuristic's reward to whatever action it had chosen.
+> Planet IDs occasionally exceed 39 in edge cases (comets or rare configurations). Defensive clamping: if `pid < N_PLANETS: mask[pid] = True`.
 
 **What's the damage?**
 
@@ -929,7 +936,200 @@ The value head *still* learns because its gradient path goes: `value_head → gl
 `edge_index` doesn't need gradients — it's just integer indices telling PyTorch which nodes to aggregate. That's fine as `torch.tensor()`.
 `edge_attr` does need to stay in the graph, because the GATv2 attention mechanism uses edge features to compute attention weights, and those weights influence the node embeddings h. The fix is to build `edge_attr` from slices of `x` (which is already in the graph) rather than from Python floats.
 
+### A Summary of Bugs Encountered and Fixed:
 
+**Bug 1: `action_masks()` guard in wrong place**
+```
+# WRONG — crashes on pre-reset call
+def action_masks(self):
+    obs = to_obs(self._env.state[...])   # ← NoneType error if _env is None
+    ...
+    if self._env is None:                # guard never reached
+        return ...
+
+# CORRECT — guard must be first
+def action_masks(self):
+    if self._env is None or self._done:
+        return np.ones(N_PLANETS * 2 + N_SHIP_BINS, dtype=bool)
+    obs = to_obs(self._env.state[...])
+    ...
+```
+
+**Bug 2: broken computation graph in _build_edges**
+First implementation built edge_attr from Python scalars:
+```
+# BROKEN — severs gradient path
+rel_x = diff[j, 0].item()   # .item() converts to Python float, no gradient
+attr_list.append([rel_x, rel_y, dist_norm, same_own])
+edge_attr = torch.tensor(attr_list, dtype=torch.float)   # leaf tensor, no graph
+```
+Fix: build `edge_attr` from tensor operations on `x` (which is in the graph):
+
+```
+# CORRECT — stays in computation graph
+rel_xy    = diff[j]                          # [2] slice of diff, differentiable
+dist_norm = dists[j].sqrt().unsqueeze(0)    # [1] tensor op, differentiable
+same_own  = ((x[i,2]==x[j,2]) & (x[i,2]>0.5)).float().unsqueeze(0)
+edge_attr_list.append(torch.cat([rel_xy, dist_norm, same_own]))
+edge_attr = torch.stack(edge_attr_list, dim=0)   # preserves computation graph
+
+```
+
+`edge_index` doesn't need gradients (integer indices) so `torch.tensor()` is fine there. `edge_attr` does need to stay in the graph because GATv2 attention weights depend on edge features.
+
+**Bug 3: global pooling bottleneck `(gnn_policy.py v1)`**
+First policy implementation mean-pooled all node embeddings before computing action logits:
+```
+# WRONG — loses per-node information
+global_h = h.mean(dim=0)      # [64] — all node information collapsed
+pi = self.pi_head(global_h)   # [64]
+# SB3's action_net then maps [64] → [90] flat logits
+# network has no idea which logits correspond to which planets
+```
+Diagnostic confirmation: source logit range was -0.13 to -0.25 (nearly uniform), target logits nearly uniform at ~0.031 probability each. The network had learned coarse win/loss prediction (explained variance 0.93) but couldn't identify which specific planet to target.
+Fix: per-node scoring before scattering into fixed slots.
+
+**Bug 4: optimiser missing GNN parameters (critical)**
+This was the most damaging bug. SB3 creates the optimiser during `super().__init__()`, before `_build_gnn()` adds our custom parameters:
+```
+def __init__(self, ...):
+    super().__init__(...)   # optimiser created HERE with parameters known at this point
+    self._build_gnn()       # encoder/scorers added AFTER — optimiser never sees them
+```
+Diagnostic: optimiser had 22,204 parameters, policy had 45,545. GNN weights computed gradients correctly but the optimiser had no parameter groups to update. Weights never moved. `policy_gradient_loss` was ~1e-10 across every training run. `approx_kl` and `clip_fraction` were exactly 0.
+Fix: rebuild the optimiser after _build_gnn():
+```
+def __init__(self, ...):
+    kwargs['net_arch'] = []
+    super().__init__(observation_space, action_space, lr_schedule, **kwargs)
+    self._build_gnn()
+    # rebuild optimiser now that all parameters exist
+    self.optimizer = self.optimizer_class(
+        self.parameters(),
+        lr=lr_schedule(1),
+        **self.optimizer_kwargs,
+    )
+```
+This fix persists through `MaskablePPO.save()` / `MaskablePPO.load()` — verified post-reload with parameter count diagnostic.
+
+### Training Runs
+
+* **Baseline: MLP with masking** (`gnn_orbitwars_env.py`)
+
+Purpose: validate masking infrastructure before adding GNN complexity.
+
+Config: `MlpPolicy`, `MultiDiscrete([40, 40, 10])`, sparse +1/-1 reward, `n_steps=2048`, `n_envs=4`, `lr=3e-4`, `n_epochs=10`.
+
+Result: `ep_rew_mean` started at 0.58 (masking baseline — legal random actions beat random opponent), peaked at 0.64, then declined to 0.44. `policy_gradient_loss` nonzero but policy drifted downward. Win rate 11% deterministic, 79% stochastic.
+
+Diagnosis: source probs nearly uniform (top prob 0.034 vs baseline 0.025). Ship probs nearly uniform. The MLP can't extract meaningful features from the flat padded observation — it memorises planet IDs rather than learning ownership patterns. The large stochastic/deterministic gap confirms distributions are too flat for argmax to work reliably.
+
+Key insight: `ep_rew_mean` ~0.58 at initialisation reflects the masking working — randomly sampled legal actions beat a fully random opponent ~58% of the time. The policy needs to improve above that baseline, which requires meaningful feature extraction.
+
+* **Run 1: GNN with global pooling** (`gnn_policy.py`)
+
+Purpose: test GNN pipeline with SB3. Architecture was `GNNExtractor` as `mlp_extractor` replacement, global mean pool → [64] → SB3 standard action/value heads.
+
+Result: `ep_rew_mean` reached 0.72 stochastically. 5% win rate deterministic. Source selection sharp (one planet got 1.0000 probability when only one planet owned), target selection nearly uniform.
+
+Diagnosis: the global pool collapses per-node information before action logits are computed. SB3's action_net maps [64] → [90] without knowing which logits correspond to which planets.
+
+Source selection worked incidentally (only 1-2 owned planets, global pool encodes ownership clearly). Target selection failed completely.
+
+Additionally: `policy_gradient_loss` ~1e-10 — optimiser bug not yet identified at this stage, though it was present. Training appeared to work only because the previous run's checkpoint was loaded for evaluation.
+
+* **Run 2: GNN with per-node scoring, broken edge gradients** (`gnn_policy_v2.py`)
+
+Purpose: fix global pooling bottleneck by implementing proper per-node source/target scoring.
+
+Architecture change: `_get_logits_and_value()` central method, `source_scorer` Linear(64→1), `target_scorer` Linear(64→1), scatter into fixed `[40]` slots, global pool for ship and value only.
+
+Result: `policy_gradient_loss` still ~1e-10. Weights not moving. Optimiser bug still present **AND** edge gradient bug newly introduced.
+
+Diagnosis: `torch.tensor()` calls in `_build_edges` from Python lists created leaf tensors with no gradient history. Encoder weights received no gradient through the attention mechanism. 
+
+Value head still learned (gradient path through `x` was intact) but policy head was severed.
+
+* **Run 3: GNN with fixed edge gradients, optimiser still broken** (`gnn_policy_v3.py`)
+
+Purpose: fix edge gradient bug.
+
+Fix: `edge_attr` built from tensor operations on `x` using `torch.stack` rather than `torch.tensor(list)`.
+
+Result: gradients flowed correctly in standalone backward pass. But `policy_gradient_loss` still ~1e-10, weights still not moving.
+
+Diagnosis: standalone gradient check passed but `evaluate_actions` during training showed `log_prob_new == log_prob_old` exactly (ratio = 1.000000, difference = 0.000000). This confirmed the optimiser bug — gradients computed correctly but optimiser had no parameter groups pointing to GNN weights.
+
+Confirmed via: optimiser parameter count = 22,204, policy parameter count = 45,545. SB3 created optimiser during `super().__init__()` before `_build_gnn()` added encoder/scorer/head parameters.
+
+* **Run 4: first working GNN training** (`gnn_policy_v3.py` + optimiser fix)
+
+Purpose: fix optimiser bug and run real training.
+
+Fix: rebuild optimiser after `_build_gnn()` in `__init__`.
+
+Verification before training:
+
+Optimiser params: 45,545 ✅
+Policy params: 45,545 ✅
+Encoder weights changed after one update: True, delta 0.007258 ✅
+Scorer weights changed after one update: True, delta 0.002714 ✅
+log_prob_new - log_prob_old nonzero ✅
+
+Config: sparse +1/-1 reward first, then switched to intermediate rewards (+0.5 per capture, -0.3 per loss, terminal +5/-5), `n_steps=2048`, `n_envs=4`, `lr=1e-4`, `n_epochs=5`, `ent_coef=0.02`, `max_grad_norm=0.5`, `opponent=random`.
+
+Results at 80k steps:
+
+* `approx_kl: 0.005-0.009` (healthy, stable)
+* `clip_fraction: 0.016-0.039` (low but real)
+* `explained_variance`: climbed from `0.006 → 0.895` (value head learning well)
+* `ep_rew_mean: 17.8 → 19.9` (trending upward)
+* `policy_gradient_loss`: consistently negative `~-0.002` (actor updating)
+```
+Win rate: 28-36% deterministic, 80-82% stochastic vs random
+```
+
+Remaining concern — scorer weights not learning fast enough:
+* `source_scorer.weight norm: 0.024`. `target_scorer.weight norm: 0.016`. Nearly at initialisation after 80k steps. Source probs: 0.50/0.50 over 2 owned planets — barely moved from uniform. Target probs: completely uniform (~0.031 each).
+* The encoder learns because the value head provides a strong gradient signal. The scorers receive weaker signal because with nearly uniform logits, `log_prob` barely changes with scorer weight changes — the cold start problem.
+* Reward farming observed: losses averaging total reward 5.42-9.21 — agent accumulates captures in games it ultimately loses. Terminal -5 partially offset by intermediate captures.
+
+### Remaining problems:
+
+* Large stochastic/deterministic gap (80% vs 28-36%) — distributions too flat for argmax
+* Scorer weights near initialisation — cold start problem
+* Reward farming with intermediate reward scheme
+
+Next steps in order:
+
+* Fix reward function: 0.2*(captures - losses) intermediate, terminal +5/-5 — eliminates farming incentive
+* Scorer warm-up: synthetic supervised pre-training on ownership signal to break scorer cold start
+* Continue PPO training from 80k checkpoint with fixed reward and warm-up scorers
+* Graduate opponent to heuristic agent once win rate vs random stabilises above 70% deterministic
+
+### Hyperparameter Notes
+
+|Parameter |Value | Rationale |
+| ----------| ----| ----------|
+|`lr` |1e-4 | 3e-4 caused clip fraction drift above 0.2|
+| `n_steps` |2048| Smaller values (256) give noisy advantage estimates |
+|`n_envs` | 4 | 4x data throughput, independent masking per env| 
+| `n_epochs` 5| 10 caused overfitting within each rollout batch| 
+| `ent_coef` | 0.02| Maintains exploration, prevents premature convergence|
+|`max_grad_norm` |0.5 | Protects against spikes while value head calibrates|
+|`gamma` | 0.99| Standard, games are up to 400 steps| 
+| `batch_size| 64| Standard SB3 default |
+
+### Flagged for Future Work
+
+* Separate encoders for source vs target scoring (currently shared — one encoder, two scorer heads)
+* Fleet information as node/edge features (significant upgrade, deferred for complexity)
+* Sun node as additional graph node (always connected to all planets)
+* `torch_geometric.data.Batch` for batched graph processing (currently sequential per-sample loop, ~16fps)
+* Opponent curriculum: `random → heuristic → beam search → self-play`
+* E(2)-equivariant layers for strict SO(2) equivariance (GATv2 with relative positions is approximately but not strictly equivariant)
+* Action masking for `source == target` case (currently falls through to do-nothing)
+* Early stopping callback based on `rolling ep_rew_mean`
 
 ---
 ## References
