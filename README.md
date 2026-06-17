@@ -541,9 +541,7 @@ Further improvements are unlikely to come from PPO hyperparameter tuning alone. 
 ---
 ## PPO Implementation via Graph Neural Networks
 
-### A Lightning Introduction to Graph Neural Networks
-
-### Why GNNs?
+### Why Graph Neural Networks (GNNs)?
 The MLP policy hit a hard architectural ceiling (~50-60% win rate vs random, ~20% vs heuristic). The root causes were all representational:
 * Fixed planet ID memorisation: the MLP saw a flat padded vector where planet ID 0's features were always in positions 0-4. It learned correlations with specific positions rather than ownership patterns.
 * Single dispatch: the MLP produced one action per turn. The heuristic sends from every planet simultaneously. No amount of training closes a 5x action rate gap.
@@ -1099,18 +1097,36 @@ Remaining concern — scorer weights not learning fast enough:
 * The encoder learns because the value head provides a strong gradient signal. The scorers receive weaker signal because with nearly uniform logits, `log_prob` barely changes with scorer weight changes — the cold start problem.
 * Reward farming observed: losses averaging total reward 5.42-9.21 — agent accumulates captures in games it ultimately loses. Terminal -5 partially offset by intermediate captures.
 
-### Remaining problems:
+### Final Experiment: Reward Fix + Scorer Warm-up
 
-* Large stochastic/deterministic gap (80% vs 28-36%) — distributions too flat for argmax
-* Scorer weights near initialisation — cold start problem
-* Reward farming with intermediate reward scheme
+* **Reward function fix**
 
-Next steps in order:
+Changed intermediate reward from `0.5*captures - 0.3*losses` to `0.2*(captures - losses)`, terminal unchanged at `+5/-5`. Confirmed via diagnostic that the farming incentive was real: under the old formula, losses averaged total reward of 5.42-9.21 (positive even when losing), meaning the agent accumulated net intermediate reward in games it ultimately lost. Under the new formula, captures and losses cancel — net territorial gain is rewarded, repeated capture/recapture cycles are not.
 
-* Fix reward function: 0.2*(captures - losses) intermediate, terminal +5/-5 — eliminates farming incentive
-* Scorer warm-up: synthetic supervised pre-training on ownership signal to break scorer cold start
-* Continue PPO training from 80k checkpoint with fixed reward and warm-up scorers
-* Graduate opponent to heuristic agent once win rate vs random stabilises above 70% deterministic
+* **Scorer warm-up**
+
+Generated 2000 synthetic samples from fresh game resets (no gameplay simulation needed — just initial observations). Each sample: a 243-dim feature vector, a random owned planet as `source_id label`, and (after iteration) a boolean mask of all unowned planets as valid targets.
+1. First attempt — single-label cross-entropy on target: failed. `tgt_loss` stayed flat at 3.32 across 10 epochs while `src_loss` decreased normally (2.92 → 1.87). Diagnosis: with 20-      35 unowned planets per game, a single random target label provides contradictory signal across batches — nearly identical game states get different "correct" target labels, so scorer can't learn a consistent pattern.
+2. Second attempt — binary cross-entropy with multi-label target mask: `tgt_loss` dropped sharply (3.32 → 0.09) but this was diagnosed as entropy collapse to a static feasibility map rather than genuine target preference. BCE trains `P(target_valid | state)` — "is this planet a legal target" — not `P(target | source, state)` — "is this the best target given the chosen source." The distinction matters: the policy head learned a global affordance map, not a best-response function.
+3. Third attempt — logsumexp set-likelihood loss: masked invalid target logits to -1e9, then minimized `-logsumexp(log_probs)` over the valid set. This pushes probability mass toward the valid target set collectively without specifying which member is best. `tgt_loss` converged to 0.0095-0.0152 — much lower than BCE, indicating the model learned to concentrate mass on valid targets specifically. Saved as `warmup_checkpoint.pt`.
+
+Result after warm-up: `source_scorer.weight` norm grew from 0.024 → 0.564-0.569 (substantial, source discrimination genuinely improved — confirmed by source probs becoming sharp when few planets owned). `target_scorer.weight` norm grew from 0.016 → 0.591-0.593, but target probability discrimination remained weak (top target probability 0.0405 vs uniform baseline 0.0312 — only ~30% above random). The warm-up moved the scorer's weight magnitude but not its discriminative power for targets specifically.
+
+**Conclusion**: the warm-up successfully broke the cold start for source scoring (few candidates, clear ownership signal) but could not teach meaningful target discrimination (many candidates, no single correct answer in the synthetic data). This is a data problem, not an optimisation problem — synthetic labels fundamentally cannot encode strategic target preference.
+
+## Continued PPO training (v5, 40k → 146k steps)
+Resumed training from the v5 checkpoint (40k steps, post-warm-up, new reward function) for an additional 106k steps. Unfroze all parameters first — confirmed 0 frozen, 45,545 trainable.
+|Steps |ep_rew_mean |explained_variance| Deterministic win rate vs random|
+|------|-----------|----------------|------------------------------------|
+|40k| 6.45|0.60|18%|
+|146k| 18.5| 0.86| 27%|
+
+Key finding: `explained_variance` improved substantially (0.60 → 0.86) while deterministic win rate improved marginally. 
+
+Diagnosis: the gap between stochastic (~80% at peak) and deterministic (27%) performance is structural, not a training-duration problem. Target scorer logits remain close together in absolute value across candidates (a 20-35 planet field dilutes any fixed logit spread far more than the 1-4 planet source field). Stochastic sampling tolerates this — the relative ranking is often correct even with small margins. Argmax does not — it is brittle to small numerical differences between top candidates, and more training did not sharpen those margins because nothing in the architecture forces them to sharpen.
+
+Root cause identified: `target_scorer` computes a score for each candidate planet independently of which source planet was chosen. A planet 5 units away is a very different target depending on whether the source has 100 ships or 10 ships, whether it's already under threat, or what the opponent's nearest fleet is doing — none of this is expressible because the target score has no dependency on the source. This is the same class of problem we diagnosed in the original global-pooling bug (Bug 3), one level deeper: per-node independent scoring is more expressive than global pooling, but still not expressive enough for conditional decisions.
+
 
 ### Hyperparameter Notes
 
@@ -1125,6 +1141,11 @@ Next steps in order:
 |`gamma` | 0.99| Standard, games are up to 400 steps| 
 | `batch_size| 64| Standard SB3 default |
 
+## Project Status at Stopping Point
+Confirmed working: full GNN pipeline, graph reconstruction, GATv2 encoder with edge features, action masking, optimiser covering all parameters, gradient flow through the entire network, PPO training loop, checkpoint save/load cycle preserving all fixes, reward shaping without farming incentive, value head reaching 0.86+ explained variance.
+Confirmed bugs found and fixed: action mask guard ordering, severed computation graph in `_build_edges` (`torch.tensor` from Python list), global pooling bottleneck discarding per-node information, optimiser missing GNN parameters (the most damaging — silently prevented all learning across multiple full training runs before discovery).
+Final characterized limitation: independent per-node target scoring cannot learn argmax-quality target selection because target value is fundamentally conditional on the chosen source, not an independent property of the target alone. This is supported by a clean ablation: 106k additional PPO steps and a 0.26-point gain in `explained_variance` produced zero change in deterministic win rate.
+
 ### Flagged for Future Work
 
 * Separate encoders for source vs target scoring (currently shared — one encoder, two scorer heads)
@@ -1135,6 +1156,8 @@ Next steps in order:
 * E(2)-equivariant layers for strict SO(2) equivariance (GATv2 with relative positions is approximately but not strictly equivariant)
 * Action masking for `source == target` case (currently falls through to do-nothing)
 * Early stopping callback based on `rolling ep_rew_mean`
+* Conditional target scoring (highest priority, addresses the root cause directly): concatenate the chosen source's node embedding with each candidate target's node embedding before scoring, so `target_score = f(h_source, h_target)` rather than `f(h_target)` alone. Requires restructuring the policy to sample source first, then condition target logits on it — a two-stage autoregressive action head rather than three independent distributions.
+* Real imitation data for warm-up: collect beam search vs beam search games using `gnn_orbitwars_agents.obs_to_features` (243-dim format) with explicit `(source_id, target_id)` pairs from actual strategic decisions, not synthetic ownership labels.
 
 ---
 ## References
