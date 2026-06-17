@@ -1097,7 +1097,8 @@ Remaining concern — scorer weights not learning fast enough:
 * The encoder learns because the value head provides a strong gradient signal. The scorers receive weaker signal because with nearly uniform logits, `log_prob` barely changes with scorer weight changes — the cold start problem.
 * Reward farming observed: losses averaging total reward 5.42-9.21 — agent accumulates captures in games it ultimately loses. Terminal -5 partially offset by intermediate captures.
 
-### Final Experiment: Reward Fix + Scorer Warm-up
+------------
+## Final Experiment: Reward Fix + Scorer Warm-up
 
 * **Reward function fix**
 
@@ -1141,7 +1142,7 @@ Root cause identified: `target_scorer` computes a score for each candidate plane
 |`gamma` | 0.99| Standard, games are up to 400 steps| 
 | `batch_size| 64| Standard SB3 default |
 
-## Project Status at Stopping Point
+### Project Status at Stopping Point
 Confirmed working: full GNN pipeline, graph reconstruction, GATv2 encoder with edge features, action masking, optimiser covering all parameters, gradient flow through the entire network, PPO training loop, checkpoint save/load cycle preserving all fixes, reward shaping without farming incentive, value head reaching 0.86+ explained variance.
 Confirmed bugs found and fixed: action mask guard ordering, severed computation graph in `_build_edges` (`torch.tensor` from Python list), global pooling bottleneck discarding per-node information, optimiser missing GNN parameters (the most damaging — silently prevented all learning across multiple full training runs before discovery).
 Final characterized limitation: independent per-node target scoring cannot learn argmax-quality target selection because target value is fundamentally conditional on the chosen source, not an independent property of the target alone. This is supported by a clean ablation: 106k additional PPO steps and a 0.26-point gain in `explained_variance` produced zero change in deterministic win rate.
